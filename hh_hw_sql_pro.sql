@@ -748,8 +748,12 @@ ORDER BY channel;
 -- Показатели: доля откликов с первым контактом в течение 24 часов, медиана времени до первой коммуникации, 
 -- доля первых контактов в течение 24 часов среди откликов с коммуникацией.
 --
--- Гипотеза 2: по откликам, которые закончились приглашением, больше контактов, чаще звонок и кандидат чаще проявляет активность в первые 24 часа.
--- Показатели: среднее число коммуникаций, доля откликов со звонком, доля откликов с сообщениями кандидата, среднее число сообщений кандидата.
+-- Гипотеза 2а (работодатель): по откликам с приглашением работодатель общается интенсивнее:
+-- больше контактов и чаще звонит.
+-- Показатели: среднее число коммуникаций, доля откликов со звонком.
+--
+-- Гипотеза 2б (кандидат): по откликам с приглашением кандидат активнее в первые 24 часа.
+-- Показатели: доля откликов с сообщениями кандидата, среднее число сообщений кандидата.
 --
 -- Дополнительный разрез: проверяю, объясняется ли разница в приглашениях направлением, а не коммуникацией.
 -- Запрос:
@@ -892,10 +896,11 @@ SELECT CASE WHEN rs.status = 'invited' THEN 'invited' ELSE 'other' END AS grp,
 	   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rs.hours_to_first_communication)::DECIMAL, 2) AS median_hours_first,
 	   ROUND(100.0 * COUNT(*) FILTER (WHERE rs.hours_to_first_communication < 24)
 	         / NULLIF(COUNT(*) FILTER (WHERE rs.communication_cnt > 0), 0), 2) AS pct_first_within_24h_with_comm,
-	   -- Гипотеза 2
+	   -- Гипотеза 2а
 	   ROUND(AVG(rs.communication_cnt) FILTER (WHERE rs.communication_cnt > 0), 2) AS avg_communications,
 	   ROUND(100.0 * COUNT(*) FILTER (WHERE rs.calls_cnt > 0)
 	         / NULLIF(COUNT(*) FILTER (WHERE rs.communication_cnt > 0), 0), 2) AS pct_with_call,
+	   -- Гипотеза 2б
 	   ROUND(100.0 * COUNT(*) FILTER (WHERE rs.communication_cnt > 0 AND COALESCE(am.applicant_msgs, 0) > 0)
 	         / NULLIF(COUNT(*) FILTER (WHERE rs.communication_cnt > 0), 0), 2) AS pct_applicant_wrote,
 	   ROUND(AVG(COALESCE(am.applicant_msgs, 0)) FILTER (WHERE rs.communication_cnt > 0), 2) AS avg_applicant_msgs
@@ -1032,6 +1037,137 @@ FROM response_summary
 GROUP BY professional_role
 ORDER BY conversion_pct DESC;
 
+
+-- Витрина уровня отклика из прошлого задания
+WITH responses_prep AS (
+	-- Отбор нужных данных из откликов
+	SELECT response_id,
+		   created_at
+	FROM responses
+),
+calls_prep AS (
+    -- Подходящие звонки 
+	SELECT response_id,
+		   employer_id,
+		   call_id AS event_id,
+		   call_at AS event_at,
+		   'call' AS event_type
+	FROM calls
+	WHERE response_id IS NOT NULL AND caller_role = 'employer' AND status <> 'error'
+),
+messages_prep AS (
+	-- Подходящие сообщения
+	SELECT response_id,
+		   employer_id,
+		   message_id AS event_id,
+		   sent_at AS event_at,
+		   'message' AS event_type
+	FROM messages
+	WHERE sender_role = 'employer'
+),
+all_events AS (
+    -- Объединение
+	SELECT response_id,
+		   employer_id,
+		   event_id,
+		   event_at,
+		   event_type  
+	FROM calls_prep
+	UNION ALL
+	SELECT response_id,
+		   employer_id,
+		   event_id,
+		   event_at,
+		   event_type
+	FROM messages_prep
+),
+events_7d AS (
+	-- Коммуникации в первые 7 дней после отклика
+	SELECT a.response_id,
+		   a.employer_id,
+		   a.event_id,
+		   a.event_at,
+		   a.event_type
+	FROM all_events a JOIN responses_prep r USING(response_id)
+	WHERE a.event_at >= r.created_at AND a.event_at < r.created_at + INTERVAL '7 days'
+),
+event_layer AS (
+       -- Слой уровня событий
+	   SELECT response_id,
+	   employer_id,
+	   event_id,
+	   event_at,
+	   event_type,
+	   ROW_NUMBER() OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id) AS event_number,
+	   LAG(event_at) OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id) AS previous_time,
+	   LEAD(event_type) OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id) AS next_type,
+	   COUNT(*) OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS from_start_to_now_cnt,
+	   FIRST_VALUE(event_type) OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id) AS first_event_for_response,
+	   LAST_VALUE(event_type) OVER (PARTITION BY response_id ORDER BY event_at, event_type, event_id
+	   								ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_event_for_response
+FROM events_7d
+),
+responses_status AS (
+	-- Отбор нужных данных из откликов
+	SELECT response_id,
+	       status,
+	       vacancy_id
+ 	FROM responses
+),
+vacancies_prep AS (
+	-- Отбор нужных данных из вакансий
+	SELECT vacancy_id, 
+		   employer_id,
+		   professional_role
+    FROM vacancies
+),
+response_events AS (
+    -- Подсчет значений для витрины
+	SELECT response_id,
+		   COUNT(*) AS communication_cnt,
+		   COUNT(*) FILTER (WHERE event_type = 'call') AS calls_cnt,
+		   COUNT(*) FILTER (WHERE event_type = 'message') AS messages_cnt,
+		   MIN(event_at) AS first_communication_at,
+		   MAX(first_event_for_response) AS first_event_type,
+		   MAX(event_type) FILTER (WHERE event_number = 2)  AS second_event_type,
+		   MAX(last_event_for_response) AS last_event_type,
+		   MAX(EXTRACT(EPOCH FROM event_at - previous_time) / 3600) AS max_gap_hours
+	FROM event_layer
+	GROUP BY response_id
+),
+response_summary AS (
+    -- Витрина уровня отклика
+	SELECT rp.response_id,
+		   vp.employer_id,
+		   vp.professional_role,
+		   rs.status,
+		   COALESCE (re.communication_cnt, 0) AS communication_cnt,
+		   COALESCE (re.calls_cnt, 0) AS calls_cnt,
+		   COALESCE (re.messages_cnt, 0) AS messages_cnt,
+		   re.first_communication_at,
+		   re.first_event_type,
+		   re.second_event_type,
+		   re.last_event_type,
+		   ROUND(EXTRACT(EPOCH FROM re.first_communication_at - rp.created_at) / 3600, 2) AS hours_to_first_communication,
+		   ROUND(re.max_gap_hours, 2) AS max_gap_hours
+	FROM responses_prep rp JOIN responses_status rs USING(response_id)
+	LEFT JOIN vacancies_prep vp USING(vacancy_id)
+	LEFT JOIN response_events re USING(response_id)
+)
+
+-- Сравнение приглашённых и остальных внутри направления
+SELECT professional_role,
+	   CASE WHEN status = 'invited' THEN 'invited' ELSE 'other' END AS grp,
+	   COUNT(*) AS responses_cnt,
+	   COUNT(*) FILTER (WHERE communication_cnt > 0) AS with_communication_cnt,
+	   ROUND(100.0 * COUNT(*) FILTER (WHERE communication_cnt > 0) / COUNT(*), 2) AS pct_with_communication,
+	   ROUND(100.0 * COUNT(*) FILTER (WHERE hours_to_first_communication < 24) / COUNT(*), 2) AS pct_first_within_24h_all,
+	   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hours_to_first_communication)::DECIMAL, 2) AS median_hours_first,
+	   ROUND(AVG(communication_cnt) FILTER (WHERE communication_cnt > 0), 2) AS avg_communications
+FROM response_summary
+GROUP BY professional_role, grp
+ORDER BY professional_role, grp;
+
 -- Вывод:
 -- Группы: 
 --     Отклики с приглашением: 92, из них с коммуникацией 54,
@@ -1042,14 +1178,19 @@ ORDER BY conversion_pct DESC;
 -- а среди откликов с коммуникацией первый контакт в течение суток был у 33,33% против 31,71%.
 -- Различия небольшие, значимой разницы нет.
 --
--- Гипотеза 2: не подтверждается. По откликам с коммуникацией: среднее число коммуникаций
--- 2,78 против 2,88, звонок был у 27,78% против 26,52%, кандидат писал в первые 24 часа в 24,07%
--- против 25,00% случаев. Значимой разницы нет.
+-- Гипотеза 2а: не подтверждается. По откликам с коммуникацией среднее число коммуникаций
+-- 2,78 против 2,88 (у приглашённых даже меньше), доля откликов со звонком 27,78% против 26,52%.
+-- Работодатель не общается интенсивнее с теми, кого потом приглашает.
 --
--- Разрез по направлению: конверсия в приглашение у тестировщиков 35,90% (14 из 39), у остальных
--- направлений 11,65-17,27%. Доля откликов с коммуникацией у тестировщиков тоже выше (74,36% против
--- 52,94-61,17%), а медиана до первой коммуникации почти одинакова (52,83-57 ч, у дата-инженера 44 ч). Внутри направления
--- приглашённые и остальные по коммуникации не различаются, поэтому связь приглашения с коммуникацией не подтверждается.
+-- Гипотеза 2б: не подтверждается. Кандидат писал в первые 24 часа у 24,07% откликов с приглашением
+-- против 25,00% остальных, в среднем 0,48 против 0,50 сообщения на отклик. Активность кандидата
+-- в начале переписки не связана с итоговым приглашением.
+--
+-- Разрез по направлению: конверсия в приглашение у тестировщиков 35,90% (14 из 39), у остальных направлений 11,65-17,27%.
+-- Внутри направлений сравнить приглашённых и остальных по коммуникации нельзя, потому что данных недостаточно. Приглашённых
+-- с коммуникацией в направлениях от 1 (Дата-инженер) до 22 (Аналитик данных), а различия зависят от направления.
+-- Например, медиана до первой коммуникации у приглашённых разработчиков 25,83 ч против 54,73 ч у остальных,
+-- а у продуктовых аналитиков 86,34 ч против 57,00 ч.
 
 
 -- ЗАДАНИЕ 8
@@ -1067,8 +1208,9 @@ ORDER BY conversion_pct DESC;
 -- 6. Особенности коммуникации с приглашением не связаны: у откликов с приглашением и без него почти одинаковы
 --    доля откликов с первым контактом в течение суток (19,57% и 19,40%), медиана до первой коммуникации
 --    (51,09 и 54,67 часа) и среднее число коммуникаций (2,78 и 2,88).
--- 7. Разница в приглашениях скорее связана с направлением, чем с тем, как работодатель общается с кандидатом, но
---    Это наблюдаемая связь, а не причинно-следственный вывод.
+-- 7. Конверсия в приглашение заметно различается по направлениям, но проверить, связана ли с ним коммуникация
+--    внутри направлений, нельзя, потому что приглашённых с коммуникацией в каждом направлении от 1 до 22. Это наблюдаемая
+--    связь, а не причинно-следственный вывод.
 -- 8. Ограничения: коммуникации работодателя учтены только за первые 7 дней, а в задании 7 первый контакт и сообщения
 --    кандидата сравнивались только за первые 24 часа; статус отклика итоговый (неизвестно, когда он стал «приглашением»),
 --    группы небольшие (54 приглашённых с коммуникацией), а из слоя исключены 8 звонков без отклика и 1 звонок с ошибкой.
